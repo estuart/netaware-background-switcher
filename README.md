@@ -263,4 +263,4 @@ Issues and PRs welcome. If you add more mappings or DE support, include:
 
 ## License
 
-MIT (or your preferred license). Add a `LICENSE` file before publishing.
+MIT
