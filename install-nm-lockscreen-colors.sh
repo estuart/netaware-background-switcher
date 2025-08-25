@@ -6,7 +6,11 @@
 #  - GDM greeter (login screen): banner + small badge logo, safe (won't cover form)
 #
 # Usage:
-#   sudo bash install-nm-lockscreen-colors.sh
+#   sudo bash install-nm-lockscreen-colors.sh                # interactive install
+#   sudo bash install-nm-lockscreen-colors.sh --map "NAME=#RRGGBB" [--map ...] [--fallback #RRGGBB]  # non-interactive
+#   sudo bash install-nm-lockscreen-colors.sh --uninstall    # uninstall
+#   sudo bash install-nm-lockscreen-colors.sh --uninstall --purge  # uninstall and remove generated swatches/badges
+#   sudo bash install-nm-lockscreen-colors.sh --help         # help
 #
 # After install:
 #   sudo nmcli connection up "<Your Connection>"
@@ -34,12 +38,121 @@ GDM_NM_HOOK="/etc/NetworkManager/dispatcher.d/60-gdm-login-bg"
 DCONF_PROFILE="/etc/dconf/profile/gdm"
 DCONF_SNIPPET="/etc/dconf/db/gdm.d/90-gdm-login-branding"
 
+print_usage() {
+  cat <<'USAGE'
+install-nm-lockscreen-colors.sh
+
+Interactive or non-interactive installer for network-aware GNOME lockscreen/desktop + GDM greeter branding.
+
+Usage:
+  sudo bash install-nm-lockscreen-colors.sh                                  # interactive install
+  sudo bash install-nm-lockscreen-colors.sh --map "NAME=#RRGGBB" [--map ...] [--fallback #RRGGBB]
+  sudo bash install-nm-lockscreen-colors.sh --uninstall                      # uninstall
+  sudo bash install-nm-lockscreen-colors.sh --uninstall --purge              # uninstall + purge images
+  sudo bash install-nm-lockscreen-colors.sh --help                           # help
+
+Flags:
+  --map "NAME=#RRGGBB"   Map a NetworkManager connection NAME to a color (repeatable)
+  --fallback #RRGGBB     Fallback color when no mapping matches (non-interactive)
+  --uninstall, -u        Remove installed files (dispatcher, greeter switcher, unit, NM hook, dconf snippet)
+  --purge, -p            With --uninstall, also delete generated swatches/badges under /usr/local/share/wallpapers
+  --help, -h             Show this help
+
+Examples:
+  sudo bash dispatcher/install-nm-lockscreen-colors.sh \
+    --map "Corp-Wired=#0b61a4" --map "Home Wi-Fi=#c9a227" --fallback #808080
+USAGE
+}
+
+uninstall_everything() {
+  local purge_flag="${1:-false}"
+  echo "Uninstalling Network-Aware GNOME background + GDM greeter components..."
+
+  # Disable and remove systemd unit
+  systemctl disable --now gdm-login-bg.service 2>/dev/null || true
+  rm -f "$GREETER_UNIT"
+
+  # Remove installed scripts/hooks
+  rm -f "$GREETER_SWITCHER" || true
+  rm -f "$GDM_NM_HOOK" || true
+  rm -f "$DISPATCHER_PATH" || true
+
+  # Remove dconf snippet and update DB
+  if [ -f "$DCONF_SNIPPET" ]; then
+    rm -f "$DCONF_SNIPPET" || true
+    dconf update 2>/dev/null || true
+  fi
+
+  # Clean runtime lock/state files
+  rm -f /run/nm-lockscreen-color.lock /run/nm-lockscreen-color.last 2>/dev/null || true
+
+  # Optional: purge generated images
+  if [ "$purge_flag" = "true" ]; then
+    echo "Purging generated swatches and badges under $WALLPAPER_DIR ..."
+    rm -f "$BADGE_DIR"/*.png 2>/dev/null || true
+    rm -f "$WALLPAPER_DIR"/*.png 2>/dev/null || true
+    rmdir "$BADGE_DIR" 2>/dev/null || true
+    rmdir "$WALLPAPER_DIR" 2>/dev/null || true
+  fi
+
+  # Restart NetworkManager to stop reacting to removed hooks
+  systemctl restart NetworkManager 2>/dev/null || true
+
+  echo "Uninstall complete."
+}
+
 # -------- Helpers / prereqs --------
 need_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "Missing required command: $1" >&2; exit 1; }; }
 
 if [ "${EUID:-$(id -u)}" -ne 0 ]; then
   echo "Please run as root (sudo)." >&2
   exit 1
+fi
+
+# -------- Argument parsing --------
+MODE="install"
+PURGE="false"
+# Non-interactive maps
+declare -A CLI_MAPS
+CLI_MAPS_COUNT=0
+CLI_FALLBACK=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help)
+      print_usage; exit 0 ;;
+    -u|--uninstall|uninstall)
+      MODE="uninstall"; shift; continue ;;
+    -p|--purge)
+      PURGE="true"; shift; continue ;;
+    --install|install)
+      MODE="install"; shift; continue ;;
+    --map)
+      shift
+      [ "${1:-}" ] || { echo "--map requires \"NAME=#RRGGBB\"" >&2; exit 1; }
+      kv="$1"
+      name="${kv%%=*}"; color="${kv#*=}"
+      if [ -z "$name" ] || [ "$name" = "$color" ]; then
+        echo "Invalid --map format. Use --map \"NAME=#RRGGBB\"" >&2; exit 1
+      fi
+      CLI_MAPS["$name"]="$color"
+      CLI_MAPS_COUNT=$((CLI_MAPS_COUNT+1))
+      shift; continue ;;
+    --fallback)
+      shift
+      [ "${1:-}" ] || { echo "--fallback requires a color like #RRGGBB" >&2; exit 1; }
+      CLI_FALLBACK="$1"; shift; continue ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      print_usage
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$MODE" = "uninstall" ]; then
+  uninstall_everything "$PURGE"
+  exit 0
 fi
 
 need_cmd nmcli
@@ -87,7 +200,7 @@ default_color_for() {
   esac
 }
 
-# -------- Prompt for colors / generate swatches & badges --------
+# -------- Build mappings (non-interactive or interactive) --------
 declare -A MAP_NAME_TO_URI   # file:// swatch URI for user-session dispatcher
 declare -A MAP_NAME_TO_BG    # absolute swatch path for GDM
 declare -A MAP_NAME_TO_LOGO  # absolute small badge path for GDM
@@ -95,46 +208,125 @@ FALLBACK_URI=""
 FALLBACK_BG_PATH=""
 LOGO_FALLBACK=""             # empty => no logo by default
 
-echo "For each connection, enter a hex color like #RRGGBB, press ENTER for default, or type 'skip' to ignore."
-echo "Installer will create: 2560x1440 swatch + 128x128 badge."
-echo
+noninteractive="false"
+map_count=${CLI_MAPS_COUNT:-0}
+fallback_val="${CLI_FALLBACK:-}"
+if [ "$map_count" -gt 0 ] || [ -n "$fallback_val" ]; then
+  noninteractive="true"
+fi
 
-for NAME in "${CONNECTIONS[@]}"; do
-  DEF="$(default_color_for "$NAME")"
-  while true; do
-    read -r -p "Color for \"$NAME\" [default ${DEF}] (or 'skip'): " REPLY || REPLY=""
-    REPLY="${REPLY:-$DEF}"
-    if [[ "$REPLY" =~ ^[sS][kK][iI][pP]$ ]]; then
-      echo "  -> Skipping \"$NAME\""
-      break
+if [ "$noninteractive" = "true" ]; then
+  echo "Running non-interactive install..."
+  for NAME in "${CONNECTIONS[@]}"; do
+    COLOR=""
+    if declare -p CLI_MAPS >/dev/null 2>&1 && [[ -v CLI_MAPS[$NAME] ]]; then
+      COLOR="${CLI_MAPS[$NAME]}"
     fi
-    if is_hex "$REPLY"; then
-      FN="$(sanitize_filename "$NAME")"
+    if [ -z "$COLOR" ]; then
+      # Skip if not provided in non-interactive mode
+      echo "  -> No color provided for \"$NAME\"; skipping"
+      continue
+    fi
+    if ! is_hex "$COLOR"; then
+      echo "  !! Invalid color for $NAME: $COLOR (expected #RRGGBB)" >&2
+      exit 1
+    fi
+    FN="$(sanitize_filename "$NAME")"
+    SWATCH_PATH="$WALLPAPER_DIR/$FN.png"
+    BADGE_PATH="$BADGE_DIR/${FN}_logo.png"
+
+    echo "  -> Generating swatch $SWATCH_PATH with color $COLOR"
+    convert -size 2560x1440 "xc:${COLOR}" "$SWATCH_PATH"
+    chmod 644 "$SWATCH_PATH"
+
+    echo "  -> Generating badge  $BADGE_PATH with color $COLOR"
+    convert -size 128x128 "xc:${COLOR}" "$BADGE_PATH"
+    chmod 644 "$BADGE_PATH"
+
+    URI="file://$SWATCH_PATH"
+    MAP_NAME_TO_URI["$NAME"]="$URI"
+    MAP_NAME_TO_BG["$NAME"]="$SWATCH_PATH"
+    MAP_NAME_TO_LOGO["$NAME"]="$BADGE_PATH"
+
+    [ -z "$FALLBACK_URI" ] && FALLBACK_URI="$URI"
+    [ -z "$FALLBACK_BG_PATH" ] && FALLBACK_BG_PATH="$SWATCH_PATH"
+  done
+
+  # Fallback override
+  fb="${CLI_FALLBACK:-}"
+  if [ -n "$fb" ]; then
+    if ! is_hex "$fb"; then
+      echo "  !! Invalid fallback color: $fb" >&2
+      exit 1
+    fi
+    # Generate fallback swatch if none created yet
+    if [ -z "$FALLBACK_BG_PATH" ]; then
+      FN="fallback"
       SWATCH_PATH="$WALLPAPER_DIR/$FN.png"
       BADGE_PATH="$BADGE_DIR/${FN}_logo.png"
-
-      echo "  -> Generating swatch $SWATCH_PATH with color $REPLY"
-      convert -size 2560x1440 "xc:${REPLY}" "$SWATCH_PATH"
+      echo "  -> Generating fallback swatch $SWATCH_PATH with color $fb"
+      convert -size 2560x1440 "xc:${fb}" "$SWATCH_PATH"
       chmod 644 "$SWATCH_PATH"
-
-      echo "  -> Generating badge  $BADGE_PATH with color $REPLY"
-      convert -size 128x128 "xc:${REPLY}" "$BADGE_PATH"
+      echo "  -> Generating fallback badge  $BADGE_PATH with color $fb"
+      convert -size 128x128 "xc:${fb}" "$BADGE_PATH"
       chmod 644 "$BADGE_PATH"
-
-      URI="file://$SWATCH_PATH"
-      MAP_NAME_TO_URI["$NAME"]="$URI"
-      MAP_NAME_TO_BG["$NAME"]="$SWATCH_PATH"
-      MAP_NAME_TO_LOGO["$NAME"]="$BADGE_PATH"
-
-      # Set fallbacks to the first defined mapping
-      [ -z "$FALLBACK_URI" ] && FALLBACK_URI="$URI"
-      [ -z "$FALLBACK_BG_PATH" ] && FALLBACK_BG_PATH="$SWATCH_PATH"
-      break
+      FALLBACK_URI="file://$SWATCH_PATH"
+      FALLBACK_BG_PATH="$SWATCH_PATH"
     else
-      echo "  !! Invalid color. Use format #RRGGBB (e.g., #0e6625)."
+      # We already have a swatch; just set URI path as fallback
+      FALLBACK_URI="file://$FALLBACK_BG_PATH"
     fi
+  fi
+else
+  echo "For each connection, enter a hex color like #RRGGBB, press ENTER for default, or type 'skip' to ignore."
+echo "Installer will create: 2560x1440 swatch + 128x128 badge."
+echo
+echo "Example colors (name and hex):"
+echo "  - Green  #0e6625"
+echo "  - Blue   #00529b"
+echo "  - Red    #b20021"
+echo "  - Orange #ff8c00"
+echo "  - Purple #6a0dad"
+echo "  - Gold   #c9a227"
+echo "  - Gray   #808080"
+echo
+
+  for NAME in "${CONNECTIONS[@]}"; do
+    DEF="$(default_color_for "$NAME")"
+    while true; do
+      read -r -p "Color for \"$NAME\" [default ${DEF}] (or 'skip'): " REPLY || REPLY=""
+      REPLY="${REPLY:-$DEF}"
+      if [[ "$REPLY" =~ ^[sS][kK][iI][pP]$ ]]; then
+        echo "  -> Skipping \"$NAME\""
+        break
+      fi
+      if is_hex "$REPLY"; then
+        FN="$(sanitize_filename "$NAME")"
+        SWATCH_PATH="$WALLPAPER_DIR/$FN.png"
+        BADGE_PATH="$BADGE_DIR/${FN}_logo.png"
+
+        echo "  -> Generating swatch $SWATCH_PATH with color $REPLY"
+        convert -size 2560x1440 "xc:${REPLY}" "$SWATCH_PATH"
+        chmod 644 "$SWATCH_PATH"
+
+        echo "  -> Generating badge  $BADGE_PATH with color $REPLY"
+        convert -size 128x128 "xc:${REPLY}" "$BADGE_PATH"
+        chmod 644 "$BADGE_PATH"
+
+        URI="file://$SWATCH_PATH"
+        MAP_NAME_TO_URI["$NAME"]="$URI"
+        MAP_NAME_TO_BG["$NAME"]="$SWATCH_PATH"
+        MAP_NAME_TO_LOGO["$NAME"]="$BADGE_PATH"
+
+        [ -z "$FALLBACK_URI" ] && FALLBACK_URI="$URI"
+        [ -z "$FALLBACK_BG_PATH" ] && FALLBACK_BG_PATH="$SWATCH_PATH"
+        break
+      else
+        echo "  !! Invalid color. Use format #RRGGBB (e.g., #0e6625)."
+      fi
+    done
   done
-done
+fi
 
 if [ "${#MAP_NAME_TO_URI[@]}" -eq 0 ]; then
   echo "No mappings defined (all skipped). Nothing to install." >&2
