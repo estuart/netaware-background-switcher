@@ -505,3 +505,260 @@ pick_active_connection() {
 # Mapping inserted by installer:
 pick_image_for_conn() {
   case "$1" in
+HEADER2
+
+# Insert mapping lines for user dispatcher (URI)
+printf "%b" "$MAPPING_CASE_USER" >>"$DISPATCHER_PATH"
+
+cat >>"$DISPATCHER_PATH" <<'FOOTER'
+    *) echo "$IMG_FALLBACK" ;;
+  esac
+}
+
+# --- Main ---
+GUI_USER="$(detect_gui_user || true)"
+if [ -z "${GUI_USER:-}" ]; then
+  log "No active local GNOME user detected; skipping."
+  exit 0
+fi
+
+if ! setup_user_bus_env "$GUI_USER"; then
+  log "No session bus for $GUI_USER; skipping."
+  exit 0
+fi
+
+ACTIVE_CONN="$(pick_active_connection)"
+[ -z "$ACTIVE_CONN" ] && ACTIVE_CONN="${CONNECTION_ID:-}"
+IMG="$(pick_image_for_conn "$ACTIVE_CONN")"
+
+if [ -f "$STATEFILE" ] && grep -qx "$GUI_USER|$ACTIVE_CONN|$IMG" "$STATEFILE" 2>/dev/null; then
+  log "No change (USER=$GUI_USER ACTIVE_CONN=$ACTIVE_CONN)."
+  exit 0
+fi
+
+log "IFACE=$IFACE STATUS=$STATUS USER=$GUI_USER ACTIVE_CONN=$ACTIVE_CONN -> $IMG"
+if apply_image "$GUI_USER" "$IMG"; then
+  printf "%s|%s|%s\n" "$GUI_USER" "$ACTIVE_CONN" "$IMG" > "$STATEFILE"
+else
+  log "ERROR: failed to apply image for $ACTIVE_CONN ($GUI_USER)"
+fi
+
+exit 0
+FOOTER
+
+chmod 755 "$DISPATCHER_PATH"
+chown root:root "$DISPATCHER_PATH"
+
+# -------- Install GDM greeter switcher (uses small badges) --------
+echo "Installing GDM greeter switcher -> $GREETER_SWITCHER"
+cat >"$GREETER_SWITCHER" <<'GDMHDR'
+#!/bin/bash
+# Set the GNOME GDM (login screen) branding based on the active network.
+# - Uses system dconf DB for "gdm"
+# - Writes background (may be ignored on RHEL), banner, and a SMALL logo badge
+# - Restarts gdm only when no users are logged in (safe)
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+TAG="gdm-login-bg"
+log(){ /usr/bin/logger -t "$TAG" "$*"; }
+
+DCONF_PROFILE="/etc/dconf/profile/gdm"
+DCONF_SNIPPET="/etc/dconf/db/gdm.d/90-gdm-login-branding"
+
+pick_active_connection() {
+  local vpn_name def_dev
+  vpn_name=$(/usr/bin/nmcli -t -f NAME,TYPE connection show --active | awk -F: '$2=="vpn"{print $1; exit}')
+  if [ -n "$vpn_name" ]; then echo "$vpn_name"; return; fi
+  def_dev=$(/usr/sbin/ip route show default 2>/dev/null | awk '{print $5; exit}')
+  if [ -n "$def_dev" ]; then
+    /usr/bin/nmcli -t -f NAME,DEVICE connection show --active | awk -F: -v d="$def_dev" '$2==d{print $1; exit}'
+    return
+  fi
+  /usr/bin/nmcli -t -f NAME connection show --active | head -n1
+}
+
+no_user_sessions_logged_in() {
+  local count
+  count=$(/usr/bin/loginctl list-sessions --no-legend | awk '$3!="gdm"{c++} END{print c+0}')
+  [ "$count" -eq 0 ]
+}
+
+ensure_gdm_profile_exists() {
+  if [ ! -f "$DCONF_PROFILE" ]; then
+    umask 022
+    cat >"$DCONF_PROFILE" <<'EOF'
+user-db:user
+system-db:gdm
+EOF
+  fi
+  mkdir -p /etc/dconf/db/gdm.d
+}
+GDMHDR
+
+# Build GDM mapping cases
+cat >>"$GREETER_SWITCHER" <<'GDM_CASE_BG_HDR'
+# Map connection -> background path (absolute; no scheme)
+pick_bg_for_conn() {
+  case "$1" in
+GDM_CASE_BG_HDR
+printf "%b" "$MAPPING_CASE_GDM_BG" >>"$GREETER_SWITCHER"
+cat >>"$GREETER_SWITCHER" <<'GDM_CASE_BG_FTR'
+    *) echo "__FALLBACK_BG__" ;;
+  esac
+}
+GDM_CASE_BG_FTR
+
+cat >>"$GREETER_SWITCHER" <<'GDM_CASE_LG_HDR'
+# Map connection -> SMALL logo badge path (absolute; no scheme)
+pick_logo_for_conn() {
+  case "$1" in
+GDM_CASE_LG_HDR
+printf "%b" "$MAPPING_CASE_GDM_LOGO" >>"$GREETER_SWITCHER"
+cat >>"$GREETER_SWITCHER" <<'GDM_CASE_LG_FTR'
+    *) echo "__LOGO_FALLBACK__" ;;
+  esac
+}
+GDM_CASE_LG_FTR
+
+cat >>"$GREETER_SWITCHER" <<'GDM3'
+apply_gdm_branding() {
+  # $1 = background absolute path (no scheme)
+  # $2 = banner label text
+  # $3 = logo absolute path (small badge) or empty to clear
+  local bg_path="$1" label="$2" logo_path="$3"
+
+  local logo_line="logo=''"
+  if [ -n "$logo_path" ]; then
+    logo_line="logo='${logo_path}'"
+  fi
+
+  umask 022
+  cat >"$DCONF_SNIPPET" <<EOF
+[org/gnome/desktop/background]
+picture-uri='file://$bg_path'
+picture-options='scaled'
+primary-color='#000000'
+secondary-color='#000000'
+
+[org/gnome/desktop/screensaver]
+picture-uri='file://$bg_path'
+picture-options='scaled'
+primary-color='#000000'
+secondary-color='#000000'
+
+[org/gnome/login-screen]
+banner-message-enable=true
+banner-message-text='ACTIVE NETWORK: $label'
+$logo_line
+EOF
+  /usr/bin/dconf update
+}
+
+main() {
+  ensure_gdm_profile_exists
+
+  local conn bg logo defdev label
+  conn="$(pick_active_connection || true)"
+  [ -z "${conn:-}" ] && conn="(none)"
+
+  bg="$(pick_bg_for_conn "$conn")"
+  [ -r "$bg" ] || bg="__FALLBACK_BG__"
+
+  logo="$(pick_logo_for_conn "$conn")"
+  [ -n "$logo" ] && [ ! -r "$logo" ] && logo=""
+
+  defdev=$(/usr/sbin/ip route show default 2>/dev/null | awk '{print $5; exit}')
+  label="$conn"
+  [ -n "$defdev" ] && label="$conn (defroute: $defdev)"
+
+  log "ACTIVE_CONN=$conn -> GDM bg=$bg logo=${logo:-<none>} label=\"$label\""
+  apply_gdm_branding "$bg" "$label" "$logo"
+
+  if no_user_sessions_logged_in; then
+    log "No user sessions detected; restarting gdm to apply greeter branding."
+    /usr/bin/systemctl try-restart gdm.service || true
+  else
+    log "User session(s) active; not restarting gdm."
+  fi
+}
+
+main "$@"
+GDM3
+
+# Replace fallbacks in the greeter switcher
+sed -i "s|__FALLBACK_BG__|${FALLBACK_BG_PATH//|/\\|}|g" "$GREETER_SWITCHER"
+sed -i "s|__LOGO_FALLBACK__|${LOGO_FALLBACK//|/\\|}|g" "$GREETER_SWITCHER"
+
+chmod 755 "$GREETER_SWITCHER"
+chown root:root "$GREETER_SWITCHER"
+
+# -------- Install GDM systemd unit --------
+echo "Installing GDM systemd unit -> $GREETER_UNIT"
+cat >"$GREETER_UNIT" <<UNIT
+[Unit]
+Description=Set GDM greeter branding based on active network
+After=network-online.target gdm.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$GREETER_SWITCHER
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+chmod 644 "$GREETER_UNIT"
+systemctl daemon-reload
+systemctl enable --now gdm-login-bg.service || true
+
+# -------- Install NM dispatcher hook for GDM (react on network changes) --------
+echo "Installing GDM NM hook -> $GDM_NM_HOOK"
+cat >"$GDM_NM_HOOK" <<'NMHOOK'
+#!/bin/bash
+# Update GDM greeter branding on decisive NM events.
+IFACE="$1"; STATUS="$2"
+case "$STATUS" in
+  up|vpn-up|down|vpn-down)
+    /usr/local/sbin/gdm-login-bg-switcher
+    ;;
+esac
+NMHOOK
+chmod 755 "$GDM_NM_HOOK"
+chown root:root "$GDM_NM_HOOK"
+
+# -------- Finalize --------
+echo
+echo "Restarting NetworkManager..."
+systemctl restart NetworkManager || true
+
+echo
+echo "Installation complete."
+
+echo
+echo "Mappings configured:"
+for NAME in "${!MAP_NAME_TO_URI[@]}"; do
+  printf "  %-30s -> %s\n" "$NAME" "${MAP_NAME_TO_URI[$NAME]}"
+done
+
+cat <<'POST'
+--------------------------------------------------------------------------------
+Test user-session background:
+  sudo nmcli connection up "<Your Connection>"
+  journalctl -t nm-lockscreen-color -b
+
+See greeter branding:
+  - Reboot (unit sets branding after network online), or
+  - Log out to the login screen (GDM). If you change networks at the greeter,
+    the NM hook will re-run the greeter switcher (it will NOT restart gdm when
+    users are logged in).
+
+Customize later:
+  - Swatches: /usr/local/share/wallpapers/*.png
+  - Badges:   /usr/local/share/wallpapers/badges/*.png
+  - User dispatcher: /etc/NetworkManager/dispatcher.d/50-lockscreen-color
+  - GDM switcher:    /usr/local/sbin/gdm-login-bg-switcher
+  - GDM unit:        /etc/systemd/system/gdm-login-bg.service
+  - GDM dconf:       /etc/dconf/db/gdm.d/90-gdm-login-branding  (then `dconf update`)
+--------------------------------------------------------------------------------
+POST
