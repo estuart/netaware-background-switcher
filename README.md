@@ -26,7 +26,7 @@ The installer configures both per-user and login (GDM) branding:
   - Swatches: `/usr/local/share/wallpapers/*.png` (2560x1440)
   - Badges: `/usr/local/share/wallpapers/badges/*_logo.png` (128x128)
 
-> The installer can generate swatches/badges for you using ImageMagick.
+> The installer can generate swatches/badges for you using ImageMagick, or you can provide your own PNGs.
 
 ---
 
@@ -35,7 +35,7 @@ The installer configures both per-user and login (GDM) branding:
 - RHEL 8/9 with GNOME (Wayland or Xorg)
 - NetworkManager (dispatcher enabled)
 - Tools: `nmcli`, `loginctl`, `runuser`, `gsettings`, `flock`, `systemctl`, `ip`, `awk`, `sed`, `tr`, `dconf`, `logger`, `ps`, `pgrep`, `id`
-- ImageMagick `convert` (for installer’s swatch/badge generation)
+- If generating swatches: ImageMagick `convert`
 
 ---
 
@@ -43,7 +43,7 @@ The installer configures both per-user and login (GDM) branding:
 
 ```bash
 # From repo root
-sudo bash dispatcher/install-nm-lockscreen-colors.sh
+sudo bash install-nm-lockscreen-colors.sh
 # Follow prompts to pick a color for each discovered NetworkManager connection
 ```
 
@@ -59,7 +59,7 @@ sudo bash dispatcher/install-nm-lockscreen-colors.sh
 Use `--map` to define connection-to-color mappings and `--fallback` to set a default color when no mapping matches. The installer will generate swatches/badges and skip prompts.
 
 ```bash
-sudo bash dispatcher/install-nm-lockscreen-colors.sh \
+sudo bash install-nm-lockscreen-colors.sh \
   --map "Corp-Wired=#0b61a4" \
   --map "Home Wi-Fi=#c9a227" \
   --fallback #808080
@@ -72,14 +72,33 @@ Notes:
 
 ---
 
+## Use pre-supplied PNG swatches (no ImageMagick)
+
+If ImageMagick isn’t available, or you prefer to ship your own PNGs, use `--use-swatches`. Filenames must be the sanitized connection names (lowercase; spaces/punctuation to `_`), e.g. `corp-wired.png`. Optionally include a badge as `<name>_logo.png`.
+
+```bash
+# Interactive, using PNGs from ./swatches
+sudo bash install-nm-lockscreen-colors.sh --use-swatches --swatches-dir ./swatches
+
+# Non-interactive with maps, but still prefer provided PNGs where present
+sudo bash install-nm-lockscreen-colors.sh --use-swatches --swatches-dir ./swatches \
+  --map "Corp-Wired=#0b61a4" --map "Home Wi-Fi=#c9a227"
+```
+
+- If `--swatches-dir` is omitted, the installer uses `./swatches` if present, otherwise `/usr/local/share/wallpapers`.
+- When `--use-swatches` is set, swatches are copied from the directory instead of generated. If a PNG for a connection is missing, that connection is skipped (you can still provide a color to generate if ImageMagick is installed).
+
+---
+
 ## Usage
 
 ```bash
-sudo bash dispatcher/install-nm-lockscreen-colors.sh                                  # interactive install
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --map "NAME=#RRGGBB" [--map ...] [--fallback #RRGGBB]
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --uninstall                      # uninstall
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --uninstall --purge              # uninstall + remove generated swatches/badges
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --help                           # help
+sudo bash install-nm-lockscreen-colors.sh                                  # interactive install
+sudo bash install-nm-lockscreen-colors.sh --map "NAME=#RRGGBB" [--map ...] [--fallback #RRGGBB]
+sudo bash install-nm-lockscreen-colors.sh --use-swatches [--swatches-dir PATH]  # use provided PNGs
+sudo bash install-nm-lockscreen-colors.sh --uninstall                      # uninstall
+sudo bash install-nm-lockscreen-colors.sh --uninstall --purge              # uninstall + remove generated swatches/badges
+sudo bash install-nm-lockscreen-colors.sh --help                           # help
 ```
 
 - **--uninstall** removes: dispatcher, GDM switcher, GDM NM hook, systemd unit, dconf snippet, and cleans state/lock files.
@@ -149,8 +168,8 @@ sudo bash dispatcher/install-nm-lockscreen-colors.sh --help                     
 
 ```
 .
-├─ dispatcher/install-nm-lockscreen-colors.sh  # Interactive installer (install/uninstall)
-├─ swatches/                                   # Example swatches (optional)
+├─ install-nm-lockscreen-colors.sh           # Installer (install/uninstall)
+├─ swatches/                                 # Optional PNGs for --use-swatches
 └─ README.md
 ```
 
@@ -159,9 +178,9 @@ sudo bash dispatcher/install-nm-lockscreen-colors.sh --help                     
 ## Uninstall
 
 ```bash
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --uninstall
+sudo bash install-nm-lockscreen-colors.sh --uninstall
 # Or also remove generated images:
-sudo bash dispatcher/install-nm-lockscreen-colors.sh --uninstall --purge
+sudo bash install-nm-lockscreen-colors.sh --uninstall --purge
 ```
 
 This stops and removes the unit/hook/switcher, cleans state/locks, and deletes the dconf snippet. Purge also removes generated swatches/badges.
